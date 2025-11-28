@@ -6,10 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 import asyncio
 from src.map.mapStructure import handle_navigation_command
-from src.llm.stt.transcribe import FasterWhisper
-from src.llm.tts.text_to_speech import TextToSpeech
-from src.llm.voice_command_interpreter import interpretSeriesOfCommands
 from src.llm.command_parser import RobotCommandParser, R1D4CommandParser, get_parser
+from src.llm.voice_command_interpreter import interpretSeriesOfCommands
 
 
 # Server Configuration
@@ -18,11 +16,22 @@ PORT = int(os.environ.get("SERVER_PORT", 3000))  # Must match ESP32 port
 
 # Enable or disable debug mode
 DEBUG_MODE = False
-MANUAL_MODE= True
+MANUAL_MODE = True  # manual mode skips heavy STT/TTS initialization
 
-# Initialize speech modules
-TTS = TextToSpeech()
-STT = FasterWhisper()
+if not MANUAL_MODE:
+    from src.llm.stt.transcribe import FasterWhisper
+    from src.llm.tts.text_to_speech import TextToSpeech
+    TTS = TextToSpeech()
+    STT = FasterWhisper()
+else:
+    class _NoOpTTS:
+        def speak(self, text: str):
+            pass
+    class _NoOpSTT:
+        def listen_transcribe(self) -> str:
+            return ""
+    TTS = _NoOpTTS()
+    STT = _NoOpSTT()
 
 async def a_tts_speak(text: str):
     await asyncio.to_thread(TTS.speak, text)
@@ -111,7 +120,7 @@ class RobotServer:
         self.host = host
         self.port = port
         self._server: asyncio.AbstractServer | None = None
-        self._clients: dict[tuple, tuple[asyncio.StreamWriter, RobotCommandParser]] = {}  # peername -> (writer, parser)
+        self._clients: dict[tuple, tuple[asyncio.StreamWriter, RobotCommandParser, str]] = {}  # peername -> (writer, parser, bot_type)
         self._lock = asyncio.Lock()
         self._stdin_task: asyncio.Task | None = None
 
@@ -154,10 +163,10 @@ class RobotServer:
 
     async def parse_and_broadcast(self, raw_message: str):
         async with self._lock:
-            items = list(self._clients.items())  # [(peer, (writer, parser)), ...]
+            items = list(self._clients.items())  # [(peer, (writer, parser, bot_type)), ...]
         
         out: list[tuple[asyncio.StreamWriter, bytes]] = []
-        for peer, (writer, parser) in items:
+        for peer, (writer, parser, bot_type) in items:
             try:
                 payload = parser.parse_command(raw_message)
                 if isinstance(payload, bytes):
@@ -185,7 +194,7 @@ class RobotServer:
         if not sess:
             print("❌ Unknown peer")
             return
-        writer, parser = sess
+        writer, parser, bot_type = sess
         payload = parser.parse_command(raw_message)  # -> str (or bytes; if bytes, handle below)
         if isinstance(payload, bytes):
             data = payload
@@ -208,7 +217,9 @@ class RobotServer:
             message += "\n"
         data = message.encode("utf-8", errors="replace")
         async with self._lock:
-            writers, parsers = zip(*[self._clients.get(p) for p in peernames if p in self._clients])
+            tuples = [self._clients.get(p) for p in peernames if p in self._clients]
+            writers = [t[0] for t in tuples]
+            parsers = [t[1] for t in tuples]
         for w, p in zip(writers, parsers):
             if not w:
                 continue
@@ -225,7 +236,7 @@ class RobotServer:
         print(f"✅ Connection from {peer}")
 
         async with self._lock:
-            self._clients[peer] = writer, R1D4CommandParser()
+            self._clients[peer] = (writer, R1D4CommandParser(), "R1D4")
 
         try:
             if MANUAL_MODE:
@@ -238,11 +249,53 @@ class RobotServer:
                     msg = data.decode("utf-8", errors="replace").rstrip()
                     if msg:
                         print(f"📥 From {peer}: {msg}")
-                        if msg[0] == '{' and (json_msg := json.loads(msg)) and json_msg.get("command") == "register":
-                            parser = get_parser(json_msg.get("bot","Unknown"))
-                            print("Registering bot type:", json_msg.get("bot","Unknown"))
-                            async with self._lock:
-                                self._clients[peer] = writer, parser
+                        registered = False
+                        if msg.startswith("{"):
+                            try:
+                                json_msg = json.loads(msg)
+                            except Exception:
+                                json_msg = None
+                            if isinstance(json_msg, dict):
+                                # Preferred explicit registration message
+                                if json_msg.get("command") == "register" and json_msg.get("bot"):
+                                    bot_type = json_msg.get("bot")
+                                    try:
+                                        parser = get_parser(bot_type)
+                                    except Exception:
+                                        parser = R1D4CommandParser(); bot_type = "R1D4"
+                                    print(f"✅ [REGISTRATION] Client {peer} registered as {bot_type}")
+                                    print(f"   Parser type: {type(parser).__name__}")
+                                    async with self._lock:
+                                        self._clients[peer] = (writer, parser, bot_type)
+                                    parser.list_available_commands()
+                                    registered = True
+                                # Fallback: identity field
+                                elif not registered and json_msg.get("identity"):
+                                    bot_type = json_msg.get("identity")
+                                    try:
+                                        parser = get_parser(bot_type)
+                                    except Exception:
+                                        parser = R1D4CommandParser(); bot_type = "R1D4"
+                                    print(f"✅ [REGISTRATION/IDENTITY] Client {peer} registered as {bot_type}")
+                                    print(f"   Parser type: {type(parser).__name__}")
+                                    async with self._lock:
+                                        self._clients[peer] = (writer, parser, bot_type)
+                                    parser.list_available_commands()
+                                    registered = True
+                        # Text fallback
+                        if not registered:
+                            lower = msg.lower()
+                            if "hoverbot" in lower and ("register" in lower or lower.strip()=="hoverbot"):
+                                bot_type = "HOVERBOT"
+                                try:
+                                    parser = get_parser(bot_type)
+                                except Exception:
+                                    parser = R1D4CommandParser(); bot_type = "R1D4"
+                                print(f"✅ [REGISTRATION/FALLBACK] Client {peer} registered as {bot_type}")
+                                print(f"   Parser type: {type(parser).__name__}")
+                                async with self._lock:
+                                    self._clients[peer] = (writer, parser, bot_type)
+                                parser.list_available_commands()
             else:
                 # Voice-activated flow (per client)
                 while True:
@@ -320,7 +373,8 @@ class RobotServer:
                         print("❌ Invalid index.")
                         continue
                     target = peers[idx]
-                    parser = self._clients.get(target)[1]
+                    writer, parser, bot_type = self._clients.get(target)
+                    print(f"\n🤖 Selected: {bot_type} at {target}")
                     parser.list_available_commands()
                     raw_message = await a_input(f"\nEnter command for {target}: ")
                     await self.parse_and_send_to(target, raw_message)
@@ -343,8 +397,11 @@ class RobotServer:
             print("No clients connected.")
             return
         print("Connected clients:")
-        for i, p in enumerate(peers):
-            print(f"  [{i}] {p[0]}:{p[1]}")
+        async with self._lock:
+            for i, p in enumerate(peers):
+                writer, parser, bot_type = self._clients.get(p, (None, None, "Unknown"))
+                parser_name = type(parser).__name__ if parser else "None"
+                print(f"  [{i}] {p[0]}:{p[1]} - {bot_type} ({parser_name})")
 
 async def main():
     server = RobotServer(HOST, PORT)
