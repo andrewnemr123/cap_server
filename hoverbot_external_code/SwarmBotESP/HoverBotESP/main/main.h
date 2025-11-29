@@ -1,9 +1,6 @@
 #ifndef MAIN_MAIN_H_
 #define MAIN_MAIN_H_
 
-// includes
-#include <esp_log.h>
-
 // logging tags
 #define TAG_0 "Main Thread"
 #define TAG_UART "UART"
@@ -21,10 +18,10 @@
 #define STORAGE_NAMESPACE "swarmbot"
 
 // wifi defaults
-#define DEFAULT_SSID "PatwickIphone"
-#define DEFAULT_PWD "hello111"
-#define DEFAULT_SERVER_HOST "172.20.10.3" // Patrick laptop
-#define DEFAULT_SERVER_PORT 50050
+#define DEFAULT_SSID "AndrewiPhone"
+#define DEFAULT_PWD "andypass"
+#define DEFAULT_SERVER_HOST "172.20.10.2" // Patrick laptop
+#define DEFAULT_SERVER_PORT 3000
 #define DEFAULT_SCAN_METHOD WIFI_FAST_SCAN
 #define DEFAULT_SORT_METHOD WIFI_CONNECT_AP_BY_SIGNAL
 #define DEFAULT_RSSI -127

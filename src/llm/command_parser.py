@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from encodings.aliases import aliases
+import json
 
 class RobotCommandParser(ABC):
     @staticmethod
@@ -26,7 +26,6 @@ class R1D4CommandParser(RobotCommandParser):
     
     @staticmethod
     def parse_command(command_str: str) -> str:
-        command, err = None, None
         if not command_str or not command_str.strip():
             raise ValueError("Empty command string")
         parts = command_str.strip().split()
@@ -40,9 +39,30 @@ class R1D4CommandParser(RobotCommandParser):
             raise ValueError("Invalid input: numeric value required")
 
         if verb in R1D4CommandParser.commands_docs["Move"]["aliases"]:
-            return f"[{{\"command\":\"move\", \"float_data\":[{value}]}}]"
+            # Convert meters to milliseconds (assuming 0.5 m/s speed)
+            duration_ms = value * 2000.0
+            msg = {
+                "id": 1,
+                "command": "move",
+                "status": "DISPATCHED",
+                "intData": [],
+                "floatData": [duration_ms],
+                "result": 0.0,
+                "text": ""
+            }
+            return json.dumps(msg)
+            
         if verb in R1D4CommandParser.commands_docs["Turn"]["aliases"]:
-            return f"[{{\"command\":\"turn\", \"float_data\":[{value}]}}]"
+            msg = {
+                "id": 1,
+                "command": "turn",
+                "status": "DISPATCHED",
+                "intData": [],
+                "floatData": [value],
+                "result": 0.0,
+                "text": ""
+            }
+            return json.dumps(msg)
 
         raise ValueError("Invalid input: unknown command")
     
@@ -53,91 +73,93 @@ class R1D4CommandParser(RobotCommandParser):
             print(f"- {command}: {doc['description']}. Usage: {doc['usage']}")
         pass
 
-# {"id":1,"command":"FORWARD","status":"DISPATCHED","intData":[10],"floatData":[12.3],"result":0.0,"text":""}
+
 class HOVERBOTCommandParser(RobotCommandParser):
     command_docs = {
-        "Forward":  {"aliases":["forward", "f"],          "description": "Move robot forward by specified meters",  "usage": "forward <meters:float>",      "example": "forward 1.0"},
-        "Backward": {"aliases":["backward", "b"],         "description": "Move robot backward by specified meters", "usage": "backward <meters:float>",     "example": "backward 1.0"},
-        "Left":     {"aliases":["left", "l"],             "description": "Strafe left by specified meters",         "usage": "left <meters:float>",         "example": "left 0.5"},
-        "Right":    {"aliases":["right", "r"],            "description": "Strafe right by specified meters",        "usage": "right <meters:float>",        "example": "right 0.5"},
-        "Ping LIDAR":      {"aliases":["ping lidar", "pl"],       "description": "Ping the LIDAR sensor",      "usage": "ping lidar",      "example": "ping lidar"},
-        "Ping 3D Camera":  {"aliases":["ping 3d camera", "p3c"],  "description": "Ping the 3D camera sensor",  "usage": "ping 3d camera",  "example": "ping 3d camera"},
+        "Forward": {"aliases":["forward", "f"], "description": "Move robot forward by specified meters", "usage": "forward <meters:float>", "example": "forward 1.0"},
+        "Backward": {"aliases":["backward", "b"], "description": "Move robot backward by specified meters", "usage": "backward <meters:float>", "example": "backward 1.0"},
+        "Turn Left": {"aliases":["turnleft", "tl", "left"], "description": "Turn robot left by specified degrees", "usage": "turnleft <degrees:float>", "example": "turnleft 90"},
+        "Turn Right": {"aliases":["turnright", "tr", "right"], "description": "Turn robot right by specified degrees", "usage": "turnright <degrees:float>", "example": "turnright 90"},
+        "Ping": {"aliases":["ping", "p"], "description": "Ping the ultrasonic sensor", "usage": "ping", "example": "ping"},
     }
-
+    
     @staticmethod
     def parse_command(command_str: str) -> str:
         if not command_str or not command_str.strip():
             raise ValueError("Empty command string")
+        
         raw = command_str.strip().lower()
         parts = raw.split()
-
-        # Build alias lookup (alias -> canonical command key)
+        
+        # Build alias lookup
         alias_map = {}
         for canonical, meta in HOVERBOTCommandParser.command_docs.items():
             for a in meta["aliases"]:
                 alias_map[a] = canonical
-
+        
         matched_command = None
         value = None
-
-        # Try multi-word aliases first (sensor pings)
-        if len(parts) >= 2:
-            two_word = " ".join(parts[:2])
-            if two_word in alias_map and alias_map[two_word].startswith("Ping"):
-                if len(parts) != 2:
-                    raise ValueError("Invalid input: sensor ping takes no numeric argument")
-                matched_command = alias_map[two_word]
-
-        # Single-word movement or abbreviated forms
-        if not matched_command:
-            if parts[0] in alias_map:
-                canonical = alias_map[parts[0]]
-                if canonical.startswith("Ping"):
-                    if len(parts) > 2:
-                        raise ValueError("Invalid input: sensor ping takes no numeric argument")
-                    matched_command = canonical
-                else:
-                    if len(parts) != 2:
-                        raise ValueError("Invalid input: movement requires exactly one numeric argument")
-                    try:
-                        value = float(parts[1])
-                    except ValueError:
-                        raise ValueError("Invalid input: movement amount must be numerical")
-                    matched_command = canonical
-
-        if not matched_command:
-            raise ValueError("Invalid input: unknown command")
-
-        # Translate to Hoverbot legacy JSON protocol
-        command_token = matched_command.upper().replace(" ", "")  # e.g., "Ping LIDAR" -> "PINGLIDAR"
-
-        if command_token.startswith("PING"):
-            # Sensor pings carry no payload
-            return (
-                "{"
-                f"\"command\":\"{command_token}\"," 
-                "\"intData\":[],\"floatData\":[],\"status\":\"DISPATCHED\",\"result\":0.0,\"text\":\"\""
-                "}"
-            )
+        
+        # Check for ping (no arguments)
+        if parts[0] == "ping" or parts[0] == "p":
+            if len(parts) != 1:
+                raise ValueError("Invalid input: ping takes no arguments")
+            matched_command = "Ping"
+        elif parts[0] in alias_map:
+            if len(parts) != 2:
+                raise ValueError("Invalid input: movement requires exactly one numeric argument")
+            try:
+                value = float(parts[1])
+            except ValueError:
+                raise ValueError("Invalid input: movement amount must be numerical")
+            matched_command = alias_map[parts[0]]
         else:
-            # Movement with one float argument (meters)
-            return (
-                "{"
-                f"\"command\":\"{command_token}\"," 
-                "\"intData\":[],\"floatData\":[" + str(value) + "],\"status\":\"DISPATCHED\",\"result\":0.0,\"text\":\"\""
-                "}"
-            )
-
+            raise ValueError("Invalid input: unknown command")
+        
+        # Translate to ESP32 JSON protocol
+        command_token = matched_command.upper().replace(" ", "")  # "Turn Left" -> "TURNLEFT"
+        
+        if command_token == "PING":
+            msg = {
+                "id": 1,
+                "command": command_token,
+                "status": "DISPATCHED",
+                "intData": [],
+                "floatData": [],
+                "result": 0.0,
+                "text": ""
+            }
+        else:
+            # Movement commands
+            # Forward/Backward: convert meters to milliseconds (1m = 2000ms)
+            # Turn: convert degrees to milliseconds (90deg = 500ms)
+            if command_token in ["FORWARD", "BACKWARD"]:
+                duration_ms = value * 2000.0  # Adjust based on robot speed
+            else:  # TURNLEFT, TURNRIGHT
+                duration_ms = abs(value) / 90.0 * 500.0  # Adjust based on turn rate
+            
+            msg = {
+                "id": 1,
+                "command": command_token,
+                "status": "DISPATCHED",
+                "intData": [],
+                "floatData": [duration_ms],
+                "result": 0.0,
+                "text": ""
+            }
+        
+        return json.dumps(msg)
+    
     @staticmethod
     def list_available_commands():
         print("🧭 Hoverbot Commands:")
         for command, doc in HOVERBOTCommandParser.command_docs.items():
             print(f"- {command}: {doc['description']}. Usage: {doc['usage']}")
-    
-def get_parser(robotType:str) -> RobotCommandParser:
-    if robotType == "R1D4":
-        return R1D4CommandParser()
-    if robotType == "HOVERBOT":
-        return HOVERBOTCommandParser()
+
+def get_parser(robot_type: str) -> RobotCommandParser:
+    if robot_type == "R1D4":
+        return R1D4CommandParser
+    if robot_type == "HOVERBOT":
+        return HOVERBOTCommandParser
     else:
-        raise ValueError(f"Unknown robot type: {robotType}")
+        raise ValueError(f"Unknown robot type: {robot_type}")

@@ -5,6 +5,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 import asyncio
+import time
+from typing import Optional
 from src.map.mapStructure import handle_navigation_command
 from src.llm.command_parser import RobotCommandParser, R1D4CommandParser, get_parser
 from src.llm.voice_command_interpreter import interpretSeriesOfCommands
@@ -12,7 +14,8 @@ from src.llm.voice_command_interpreter import interpretSeriesOfCommands
 
 # Server Configuration
 HOST = "0.0.0.0"  # Listen on all network interfaces
-PORT = int(os.environ.get("SERVER_PORT", 3000))  # Must match ESP32 port
+PORT = int(os.environ.get("SERVER_PORT", 3000))  # TCP port for commands
+UDP_PORT = int(os.environ.get("UDP_PORT", 3001))  # UDP port for sensor data
 
 # Enable or disable debug mode
 DEBUG_MODE = False
@@ -107,37 +110,80 @@ def _build_response_from_text_or_nav(voice_command: str | None) -> str:
         print(f"❌ Build response error: {e}")
         return json.dumps([])
 
+class UDPProtocol(asyncio.DatagramProtocol):
+    """UDP protocol handler for receiving sensor data from robots."""
+    
+    def __init__(self, server: 'RobotServer'):
+        self.server = server
+        self.transport: Optional[asyncio.DatagramTransport] = None
+    
+    def connection_made(self, transport):
+        self.transport = transport
+    
+    def datagram_received(self, data: bytes, addr: tuple):
+        """Handle incoming UDP sensor data packets."""
+        try:
+            # Decode sensor data (expecting JSON format)
+            msg = data.decode('utf-8', errors='replace')
+            sensor_data = json.loads(msg)
+            
+            # Store sensor data associated with the client address
+            asyncio.create_task(self.server._handle_sensor_data(addr, sensor_data))
+            
+        except json.JSONDecodeError:
+            print(f"⚠️  Invalid JSON from {addr}: {data[:50]}...")
+        except Exception as e:
+            print(f"❌ UDP error from {addr}: {e}")
+    
+    def error_received(self, exc):
+        print(f"❌ UDP error: {exc}")
+
 class RobotServer:
     """
-    Async TCP server:
-      - Accepts multiple robot connections.
+    Hybrid TCP/UDP server:
+      - TCP: Reliable command delivery to robots
+      - UDP: High-frequency sensor data reception
       - Runs a single stdin router task to send manual commands to chosen client(s).
-      - Provides broadcast() and send_to().
-    Protocol: newline-delimited UTF-8 messages.
+    Protocol: 
+      - TCP: newline-delimited UTF-8 messages
+      - UDP: JSON-encoded sensor packets
     """
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, tcp_port: int, udp_port: int):
         self.host = host
-        self.port = port
-        self._server: asyncio.AbstractServer | None = None
+        self.tcp_port = tcp_port
+        self.udp_port = udp_port
+        self._tcp_server: asyncio.AbstractServer | None = None
+        self._udp_transport: Optional[asyncio.DatagramTransport] = None
         self._clients: dict[tuple, tuple[asyncio.StreamWriter, RobotCommandParser, str]] = {}  # peername -> (writer, parser, bot_type)
+        self._sensor_data: dict[tuple, dict] = {}  # addr -> latest sensor data
+        self._sensor_timestamps: dict[tuple, float] = {}  # addr -> last update time
         self._lock = asyncio.Lock()
         self._stdin_task: asyncio.Task | None = None
 
     async def start(self):
-        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
-        sockets = ", ".join(str(s.getsockname()) for s in (self._server.sockets or []))
-        print(f"🚀 Server running on {sockets}")
+        # Start TCP server for commands
+        self._tcp_server = await asyncio.start_server(self._handle_client, self.host, self.tcp_port)
+        tcp_sockets = ", ".join(str(s.getsockname()) for s in (self._tcp_server.sockets or []))
+        print(f"🚀 TCP Server (commands) running on {tcp_sockets}")
+        
+        # Start UDP endpoint for sensor data
+        loop = asyncio.get_running_loop()
+        self._udp_transport, _ = await loop.create_datagram_endpoint(
+            lambda: UDPProtocol(self),
+            local_addr=(self.host, self.udp_port)
+        )
+        print(f"📡 UDP Server (sensors) running on {self.host}:{self.udp_port}")
 
         # Launch the single stdin router (manual command dispatcher)
         self._stdin_task = asyncio.create_task(self._stdin_router())
         print("🧭 Command router ready (type 'help' for options).")
 
     async def serve_forever(self):
-        if not self._server:
+        if not self._tcp_server:
             raise RuntimeError("Call start() first")
-        async with self._server:
-            await self._server.serve_forever()
+        async with self._tcp_server:
+            await self._tcp_server.serve_forever()
 
     async def stop(self):
         # Stop router task first
@@ -149,10 +195,19 @@ class RobotServer:
                 pass
             self._stdin_task = None
 
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        # Stop UDP transport
+        if self._udp_transport:
+            self._udp_transport.close()
+            self._udp_transport = None
+            print("📡 UDP server stopped")
+
+        # Stop TCP server
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            self._tcp_server = None
+            print("🚀 TCP server stopped")
+            
         async with self._lock:
             for w in list(self._clients.values()):
                 try:
@@ -160,6 +215,8 @@ class RobotServer:
                 except Exception:
                     pass
             self._clients.clear()
+            self._sensor_data.clear()
+            self._sensor_timestamps.clear()
 
     async def parse_and_broadcast(self, raw_message: str):
         async with self._lock:
@@ -211,6 +268,35 @@ class RobotServer:
     async def connected_peers(self) -> list[tuple]:
         async with self._lock:
             return list(self._clients.keys())
+    
+    async def _handle_sensor_data(self, addr: tuple, sensor_data: dict):
+        """Process incoming sensor data from UDP."""
+        async with self._lock:
+            self._sensor_data[addr] = sensor_data
+            self._sensor_timestamps[addr] = time.time()
+        
+        # Optional: Log sensor data (can be verbose for high-frequency data)
+        if DEBUG_MODE:
+            data_type = sensor_data.get('type', 'unknown')
+            print(f"📊 Sensor [{data_type}] from {addr[0]}:{addr[1]}")
+    
+    async def get_latest_sensor_data(self, addr: tuple, max_age: float = 1.0) -> Optional[dict]:
+        """Get latest sensor data for a client (if recent enough)."""
+        async with self._lock:
+            if addr not in self._sensor_data:
+                return None
+            
+            age = time.time() - self._sensor_timestamps.get(addr, 0)
+            if age > max_age:
+                return None  # Data too old
+            
+            return self._sensor_data[addr].copy()
+    
+    def send_udp(self, addr: tuple, data: dict):
+        """Send UDP message to a specific address (optional, for UDP responses)."""
+        if self._udp_transport:
+            message = json.dumps(data).encode('utf-8')
+            self._udp_transport.sendto(message, addr)
 
     async def _write_to_writers(self, peernames, message: str):
         if not message.endswith("\n"):
@@ -232,8 +318,11 @@ class RobotServer:
     # ---------- Per-client handler ----------
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+# Replace lines 321-384 in server.py with this debugged version:
+
         peer = writer.get_extra_info("peername")  # (ip, port)
         print(f"✅ Connection from {peer}")
+        print(f"🔍 [DEBUG] Waiting for registration message...")
 
         async with self._lock:
             self._clients[peer] = (writer, R1D4CommandParser(), "R1D4")
@@ -243,25 +332,40 @@ class RobotServer:
                 # In manual mode, per-client handler does NOT read stdin.
                 # It just keeps the connection open and optionally logs client messages.
                 while True:
+                    print(f"🔍 [DEBUG] {peer} - Calling readline()...")
                     data = await reader.readline()
+                    print(f"🔍 [DEBUG] {peer} - Received {len(data) if data else 0} bytes: {data[:100] if data else 'EMPTY'}")
+                    
                     if not data:
+                        print(f"🔍 [DEBUG] {peer} - No data received, breaking")
                         break
+                    
                     msg = data.decode("utf-8", errors="replace").rstrip()
+                    print(f"🔍 [DEBUG] {peer} - Decoded message: '{msg}' (length: {len(msg)})")
+                    
                     if msg:
                         print(f"📥 From {peer}: {msg}")
                         registered = False
+                        
+                        # Check if it's JSON
+                        print(f"🔍 [DEBUG] {peer} - Checking if JSON (starts with '{{': {msg.startswith('{')})")
                         if msg.startswith("{"):
                             try:
                                 json_msg = json.loads(msg)
-                            except Exception:
+                                print(f"🔍 [DEBUG] {peer} - Successfully parsed JSON: {json_msg}")
+                            except Exception as e:
+                                print(f"🔍 [DEBUG] {peer} - JSON parse failed: {e}")
                                 json_msg = None
+                            
                             if isinstance(json_msg, dict):
                                 # Preferred explicit registration message
                                 if json_msg.get("command") == "register" and json_msg.get("bot"):
                                     bot_type = json_msg.get("bot")
+                                    print(f"🔍 [DEBUG] {peer} - Found 'register' command with bot={bot_type}")
                                     try:
                                         parser = get_parser(bot_type)
-                                    except Exception:
+                                    except Exception as e:
+                                        print(f"🔍 [DEBUG] {peer} - get_parser failed: {e}, defaulting to R1D4")
                                         parser = R1D4CommandParser(); bot_type = "R1D4"
                                     print(f"✅ [REGISTRATION] Client {peer} registered as {bot_type}")
                                     print(f"   Parser type: {type(parser).__name__}")
@@ -269,12 +373,15 @@ class RobotServer:
                                         self._clients[peer] = (writer, parser, bot_type)
                                     parser.list_available_commands()
                                     registered = True
+                                
                                 # Fallback: identity field
                                 elif not registered and json_msg.get("identity"):
                                     bot_type = json_msg.get("identity")
+                                    print(f"🔍 [DEBUG] {peer} - Found 'identity' field: {bot_type}")
                                     try:
                                         parser = get_parser(bot_type)
-                                    except Exception:
+                                    except Exception as e:
+                                        print(f"🔍 [DEBUG] {peer} - get_parser failed: {e}, defaulting to R1D4")
                                         parser = R1D4CommandParser(); bot_type = "R1D4"
                                     print(f"✅ [REGISTRATION/IDENTITY] Client {peer} registered as {bot_type}")
                                     print(f"   Parser type: {type(parser).__name__}")
@@ -282,20 +389,32 @@ class RobotServer:
                                         self._clients[peer] = (writer, parser, bot_type)
                                     parser.list_available_commands()
                                     registered = True
+                        
                         # Text fallback
                         if not registered:
                             lower = msg.lower()
-                            if "hoverbot" in lower and ("register" in lower or lower.strip()=="hoverbot"):
+                            print(f"🔍 [DEBUG] {peer} - Checking text fallback. lowercase msg: '{lower}'")
+                            print(f"🔍 [DEBUG] {peer} - msg.strip() == 'HOVERBOT': {msg.strip() == 'HOVERBOT'}")
+                            print(f"🔍 [DEBUG] {peer} - 'hoverbot' in lower: {'hoverbot' in lower}")
+                            
+                            # UPDATED CONDITION - handle both cases
+                            if msg.strip() == "HOVERBOT" or "hoverbot" in lower:
                                 bot_type = "HOVERBOT"
+                                print(f"🔍 [DEBUG] {peer} - Text fallback matched! Setting bot_type=HOVERBOT")
                                 try:
                                     parser = get_parser(bot_type)
-                                except Exception:
+                                    print(f"🔍 [DEBUG] {peer} - get_parser succeeded")
+                                except Exception as e:
+                                    print(f"🔍 [DEBUG] {peer} - get_parser failed: {e}, defaulting to R1D4")
                                     parser = R1D4CommandParser(); bot_type = "R1D4"
                                 print(f"✅ [REGISTRATION/FALLBACK] Client {peer} registered as {bot_type}")
                                 print(f"   Parser type: {type(parser).__name__}")
                                 async with self._lock:
                                     self._clients[peer] = (writer, parser, bot_type)
                                 parser.list_available_commands()
+                            else:
+                                print(f"🔍 [DEBUG] {peer} - No registration pattern matched")
+
             else:
                 # Voice-activated flow (per client)
                 while True:
@@ -353,9 +472,11 @@ class RobotServer:
                 cmd = (await a_input("\nTarget (list | all | <index> | help | quit): ")).strip().lower()
 
                 if cmd == "help":
-                    print("Commands:\n  list      - show connected clients\n  all       - broadcast next manual command\n  <index>   - send to indexed client\n  quit      - stop server")
+                    print("Commands:\n  list      - show connected clients\n  all       - broadcast next manual command\n  <index>   - send to indexed client\n  sensors   - show latest sensor data\n  quit      - stop server")
                 elif cmd == "list":
                     await self._print_client_list()
+                elif cmd == "sensors":
+                    await self._print_sensor_data()
                 elif cmd == "quit":
                     print("🛑 Shutting down...")
                     # stop() will cancel this task from outside main()
@@ -402,9 +523,29 @@ class RobotServer:
                 writer, parser, bot_type = self._clients.get(p, (None, None, "Unknown"))
                 parser_name = type(parser).__name__ if parser else "None"
                 print(f"  [{i}] {p[0]}:{p[1]} - {bot_type} ({parser_name})")
+    
+    async def _print_sensor_data(self):
+        """Display latest sensor data from all sources."""
+        async with self._lock:
+            if not self._sensor_data:
+                print("No sensor data received.")
+                return
+            
+            print("\n📊 Latest Sensor Data:")
+            current_time = time.time()
+            for addr, data in self._sensor_data.items():
+                age = current_time - self._sensor_timestamps.get(addr, 0)
+                sensor_type = data.get('type', 'unknown')
+                print(f"  {addr[0]}:{addr[1]} ({sensor_type}) - {age:.2f}s ago")
+                
+                # Display key sensor values
+                for key, value in data.items():
+                    if key != 'type':
+                        print(f"    {key}: {value}")
+            print()
 
 async def main():
-    server = RobotServer(HOST, PORT)
+    server = RobotServer(HOST, PORT, UDP_PORT)
     await server.start()
     try:
         await server.serve_forever()
@@ -412,5 +553,5 @@ async def main():
         await server.stop()
 
 if __name__ == "__main__":
-    print("Starting Robot Server...")
+    print("Starting Hybrid Robot Server (TCP + UDP)...")
     asyncio.run(main())
