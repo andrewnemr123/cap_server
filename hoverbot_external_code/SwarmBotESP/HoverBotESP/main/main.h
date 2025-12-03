@@ -1,12 +1,16 @@
 #ifndef MAIN_MAIN_H_
 #define MAIN_MAIN_H_
 
+// includes
+#include <esp_log.h>
+
 // logging tags
 #define TAG_0 "Main Thread"
 #define TAG_UART "UART"
 #define TAG_NVS "NVS"
 #define TAG_WIFI "WIFI"
 #define TAG_TCP "TCP"
+#define TAG_UDP "UDP"
 #define TAG_TASK "TASK"
 #define TAG_DRIVER "DRIVER"
 
@@ -29,6 +33,7 @@
 
 // server
 #define DEFAULT_IDENTITY "HOVERBOT"
+#define DEFAULT_UDP_PORT 3001
 #define MESSAGE_STATUS_SUCCESS "SUCCESS"
 #define MESSAGE_STATUS_FAILURE "FAILURE"
 

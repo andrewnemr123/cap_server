@@ -20,26 +20,124 @@
 
 ## Using SerialTool to monitor the robot
 
-Read the comments at the top of the `main.py` file in the SerialTool folder on how to use SerialTool. Once SerialTool is set up, run the command `py main.py -m` to enter Serial Monitor Mode. The board needs to be connected to the computer via USB.
+### Setup
+
+SerialTool is a Python-based utility for serial communication with ESP32-based robots. It supports both monitoring and configuration modes.
+
+#### Prerequisites
+- Python 3.11 or higher
+- pyserial package
+
+#### Installation
+
+Navigate to the SerialTool directory:
+```bash
+cd Servers/SwarmBotESP/SerialTool
+```
+
+**Option 1: Using global pyserial (simpler)**
+```bash
+pip install pyserial
+```
+
+**Option 2: Using virtual environment (recommended for development)**
+```bash
+python -m pip install virtualenv
+python -m virtualenv venv
+
+# Windows:
+.\venv\Scripts\activate
+
+# Linux/Mac:
+source venv/bin/activate
+
+# Install dependencies:
+python -m pip install -r requirements.txt
+```
+
+### Monitor Mode
+
+Monitor mode allows you to view serial output from the robot in real-time.
+
+```bash
+# Auto-detect port
+python main.py -m
+
+# Specify port explicitly
+python main.py --port COM3 -m
+```
+
+**Controls:**
+- `Ctrl + ]` to quit serial monitor
+- `Ctrl + T` for menu
+
+### Debug Mode
+
+Enable verbose debug messages:
+```bash
+python main.py -d
+python main.py --port COM3 -d
+```
+
+### Command-line Options
+
+- `--port <PORT>` - Specify serial port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux)
+- `--baudrate <RATE>` - Set baudrate (default: 115200)
+- `-m, --monitor` - Enter serial monitor mode
+- `-d, --debug` - Enable debug logging
+- `-h, --help` - Show help message
 
 ## Using SerialTool to configure the robot
 
-The following commands are currently valid to be sent by the SerialTool to the ESP32
+### Configuration Mode
 
-1. `reset`: reset values stored in flash to default hardcoded ones
-2. `done configuration`: make the ESP32 exit the configuration state
-3. `set ssid SSID_NAME`: replace SSID_NAME with the SSID of the WiFi network the board is supposed to try to connect to
-4. `set pwd PWD`: replace PWD with the password of the WiFi network
-5. `set server_host SERVER_HOST`: replace SERVER_HOST with the IPv4 address of the computer on which TcpServer is running (e.g. `set server_host 192.168.1.139`)
-6. `set server_port SERVER_PORT`: replace SERVER_PORT with the port that the server is listening to
-7. `set identity IDENTITY`: replace IDENTITY with the identity (name) of the robot (e.g. `set identity HOVERBOT`)
+Configuration mode allows you to set WiFi credentials and server connection parameters.
+
+1. Connect the ESP32 board via USB
+2. Run SerialTool in configuration mode:
+   ```bash
+   python main.py
+   # or specify port:
+   python main.py --port COM3
+   ```
+3. When prompted "Reboot the board", press the **EN button** on the ESP32
+4. Enter configuration commands when prompted
+
+### Configuration Commands
+
+| Command | Description | Example |
+|---------|-------------|----------|
+| `reset` | Reset all stored values to defaults | `reset` |
+| `set ssid <SSID>` | Set WiFi network name | `set ssid MyNetwork` |
+| `set pwd <PASSWORD>` | Set WiFi password | `set pwd MyPassword123` |
+| `set server_host <IP>` | Set Swarm Server IPv4 address | `set server_host 192.168.1.139` |
+| `set server_port <PORT>` | Set server port number | `set server_port 3000` |
+| `set identity <NAME>` | Set robot identity/name | `set identity HOVERBOT` |
+| `done configuration` | Exit configuration mode | `done configuration` |
+
+### Configuration Example
+
+```bash
+$ python main.py --port COM3
+[2025-12-02 10:30:15.123] [INFO] Using serial port COM3
+[2025-12-02 10:30:15.234] [INFO] Reboot the board. Waiting for configure request
+# Press EN button on ESP32
+[2025-12-02 10:30:18.456] [INFO] Tool Received: UART_MAGIC_ROBOT; ready
+Command to send: set ssid RoboticsLab
+[2025-12-02 10:30:22.123] [INFO] Tool Sending: UART_MAGIC_TOOL; set ssid RoboticsLab
+Command to send: set pwd SecurePassword123
+[2025-12-02 10:30:25.234] [INFO] Tool Sending: UART_MAGIC_TOOL; set pwd SecurePassword123
+Command to send: set server_host 192.168.1.100
+[2025-12-02 10:30:28.345] [INFO] Tool Sending: UART_MAGIC_TOOL; set server_host 192.168.1.100
+Command to send: set server_port 3000
+[2025-12-02 10:30:31.456] [INFO] Tool Sending: UART_MAGIC_TOOL; set server_port 3000
+Command to send: set identity HOVERBOT_01
+[2025-12-02 10:30:34.567] [INFO] Tool Sending: UART_MAGIC_TOOL; set identity HOVERBOT_01
+Command to send: done configuration
+[2025-12-02 10:30:37.678] [INFO] Tool Received: UART_MAGIC_ROBOT; configuration saved
+[2025-12-02 10:30:37.789] [INFO] Closed serial connection
+```
 
 ## Future Improvements
 
-1. Move the TCP communication with the server to a dedicated FreeRTOS task so it doesn't block other operations of the robot such as controlling the motors or getting data from the sensors. Alternatively, create new tasks to perform those operations. FreeRTOS is already enabled and tasks can be created with `xTaskCreate()` or `xTaskCreatePinnedToCore()` (since there are two cores on the ESP32)
-    - Implement the possibility of sending an "Emergency Stop" message **while** the robot is executing a task. For example, if a command of moving forward too much is sent by accident, we would like to be able to abort the command
-    - If a command that takes a long time to complete is sent, we would like to know that the robot has indeed at least received the command and is currently executing it
-    - Source code of the TcpServer will also need to be updated to implement these new changes
-
-2. Support storing multiple SSIDs and scan them by priorities or by signal strength
-3. Support automatic discovery of `server_host` once connected to a WiFi network
+TODO

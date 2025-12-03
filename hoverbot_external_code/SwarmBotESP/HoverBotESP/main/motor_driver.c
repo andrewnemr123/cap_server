@@ -3,6 +3,7 @@
 #include <freertos/task.h>
 #include <driver/gpio.h>
 #include <esp_err.h>
+#include <esp_timer.h>
 #include "main.h"
 #include "motor_driver.h"
 
@@ -88,43 +89,61 @@ void rotate_right(int duration_ms)
     gpio_set_level(RIGHT_MOTOR_DIR_PIN, DIR_FOWARD);
 }
 
-int us_ping() {
-    // TODO: Translate Arduino code 
-    // #define SOUND_SPEED 0.034
-    // #define CM_TO_INCH 0.393701
+int us_ping()
+{
+#define SOUND_SPEED 0.034 // cm/microsecond
 
-    // long duration;
-    // float distanceCm;
+    // Clear trigger pin
+    gpio_set_level(US_TRIG_PIN, 0);
+    esp_rom_delay_us(2);
 
-    // void loop() {
-    //     // Clears the trigPin
-    //     digitalWrite(trigPin, LOW);
-    //     delayMicroseconds(2);
-    //     // Sets the trigPin on HIGH state for 10 micro seconds
-    //     digitalWrite(trigPin, HIGH);
-    //     delayMicroseconds(10);
-    //     digitalWrite(trigPin, LOW);
-        
-    //     // Reads the echoPin, returns the sound wave travel time in microseconds
-    //     duration = pulseIn(echoPin, HIGH);
-        
-    //     // Calculate the distance
-    //     distanceCm = duration * SOUND_SPEED/2;
-        
-    //     delay(1000);
-    // }
+    // Send 10us pulse
+    gpio_set_level(US_TRIG_PIN, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(US_TRIG_PIN, 0);
 
-    return 0;
+    // Wait for echo pin to go HIGH
+    int timeout = 30000; // 30ms timeout
+    int count = 0;
+    while (gpio_get_level(US_ECHO_PIN) == 0 && count < timeout)
+    {
+        esp_rom_delay_us(1);
+        count++;
+    }
+
+    if (count >= timeout)
+        return -1; // timeout error
+
+    // Measure pulse width (echo HIGH duration)
+    int64_t start_time = esp_timer_get_time();
+    count = 0;
+    while (gpio_get_level(US_ECHO_PIN) == 1 && count < timeout)
+    {
+        esp_rom_delay_us(1);
+        count++;
+    }
+    int64_t end_time = esp_timer_get_time();
+
+    if (count >= timeout)
+        return -1;
+
+    long duration = (long)(end_time - start_time);
+
+    // Calculate distance in cm
+    float distance_cm = duration * SOUND_SPEED / 2.0;
+
+    return (int)distance_cm;
 }
 
 void task_blink_led(void *arg)
 {
-	int led_state = 0;
-	while (true) {
-		led_state = !led_state;
-		ESP_LOGI(TAG_DRIVER, "Turning the LED %s!", led_state == true ? "ON" : "OFF");
-		gpio_set_level(LED_BLINK_PIN, led_state);
-		ESP_LOGI(TAG_DRIVER, "Stack High Water Mark %d", uxTaskGetStackHighWaterMark(NULL));  // free bytes left in stack
-		vTaskDelay(10000 / portTICK_PERIOD_MS);  // delay ms
-	}
+    int led_state = 0;
+    while (true)
+    {
+        led_state = !led_state;
+        ESP_LOGI(TAG_DRIVER, "Turning the LED %s!", led_state == true ? "ON" : "OFF");
+        gpio_set_level(LED_BLINK_PIN, led_state);
+        ESP_LOGI(TAG_DRIVER, "Stack High Water Mark %d", uxTaskGetStackHighWaterMark(NULL)); // free bytes left in stack
+        vTaskDelay(10000 / portTICK_PERIOD_MS);                                              // delay ms
+    }
 }

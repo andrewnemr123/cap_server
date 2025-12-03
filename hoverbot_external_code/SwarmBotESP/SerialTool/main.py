@@ -1,30 +1,13 @@
-# USB serial configuration tool for SwarmBots using the ESP32 framework
-# Written with python 3.11
-#
-# Note: no need to set up venv if pyserial is installed globally
-# Setting up venv and dependencies:
-# 0: open terminal or command prompt and change directory to this folder
-# 1: python -m pip install virtualenv
-# 2: python -m virtualenv venv
-# 3 (linux): source venv/bin/activate
-# 3 (windows): .\venv\Scripts\activate
-# 4: python -m pip install -r requirements.txt
-#
-# Normal usage:
-# py main.py
-# py main.py --port COM3
-#
-# Serial monitor mode (use Ctrl + ] to quit serial monitor):
-# py main.py -m
-# py main.py --port COM3 -m
-#
-# Debug mode:
-# py main.py -d
-# py main.py --port COM3 -d
-#
-# Show help:
-# py main.py -h
-#
+"""USB serial configuration tool for SwarmBots using the ESP32 framework.
+
+Usage:
+    Normal mode:     python main.py [--port COM3]
+    Monitor mode:    python main.py -m [--port COM3]
+    Debug mode:      python main.py -d [--port COM3]
+    Help:            python main.py -h
+
+See README.md for detailed documentation.
+"""
 
 
 import argparse
@@ -173,6 +156,11 @@ if __name__ == '__main__':
     board = connect(serial_port, serial_baudrate, TIMEOUT_SERIAL_SECONDS)
     board.reset_input_buffer()
     board.reset_output_buffer()
+
+    # Release both lines so IO0 stays high and EN stays high (no bootloader)
+    # Then press EN manually once you see the log below.
+    board.setDTR(False)   # IO0 released (high)
+    board.setRTS(False)   # EN released (high)
     logging.info("Reboot the board. Waiting for configure request")
     clean_res = wait_for_expected_response(UART_MAGIC_ROBOT)
     logging.info(f"Tool Received: {clean_res}")

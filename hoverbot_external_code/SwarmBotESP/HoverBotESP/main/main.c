@@ -22,6 +22,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <esp_netif.h>
+#include <esp_timer.h>
 
 // robot drivers
 #include "motor_driver.h"
@@ -147,6 +148,71 @@ int msg_recv(int sock, char *rx_buf, int rx_buf_size)
 	return rx_len; // success if rx_len > 0
 }
 
+// UDP sensor streaming task
+// This FreeRTOS task runs in parallel with TCP command handling
+// Periodically samples ultrasonic sensor and sends UDP packets to server
+typedef struct
+{
+	int sock;
+	struct sockaddr_in dest_addr;
+} udp_task_params_t;
+
+void udp_sensor_stream_task(void *pvParameters)
+{
+	udp_task_params_t *params = (udp_task_params_t *)pvParameters;
+	int sock = params->sock;
+	struct sockaddr_in dest_addr = params->dest_addr;
+	free(params); // Free parameter struct after extracting values
+
+	ESP_LOGI(TAG_UDP, "UDP sensor streaming task started");
+
+	int tx_buf_size = 512;
+	char *tx_buf = (char *)malloc(tx_buf_size * sizeof(char));
+
+	// Stream sensor data at 10 Hz (100ms interval)
+	const TickType_t xDelay = pdMS_TO_TICKS(100);
+
+	while (1)
+	{
+		// Sample ultrasonic sensor
+		int distance_cm = us_ping();
+
+		// Get current timestamp (milliseconds since boot)
+		float timestamp = (float)esp_timer_get_time() / 1000000.0; // microseconds to seconds
+
+		// Build JSON sensor packet
+		cJSON *sensor_data = cJSON_CreateObject();
+		cJSON_AddStringToObject(sensor_data, "type", "proximity");
+		cJSON_AddNumberToObject(sensor_data, "timestamp", timestamp);
+		cJSON_AddNumberToObject(sensor_data, "distance_cm", distance_cm);
+		cJSON_AddStringToObject(sensor_data, "robot_id", g_identity);
+
+		char *json_str = cJSON_PrintUnformatted(sensor_data);
+
+		// Send UDP packet
+		int err = sendto(sock, json_str, strlen(json_str), 0,
+						 (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+		if (err < 0)
+		{
+			ESP_LOGE(TAG_UDP, "Error sending UDP packet: errno %d", errno);
+		}
+		else
+		{
+			ESP_LOGD(TAG_UDP, "Sent sensor data: %s", json_str);
+		}
+
+		// Cleanup
+		free(json_str);
+		cJSON_Delete(sensor_data);
+
+		// Wait for next iteration
+		vTaskDelay(xDelay);
+	}
+
+	free(tx_buf);
+	vTaskDelete(NULL);
+}
+
 void tcp_client(void)
 {
 	int addr_family = 0;
@@ -186,12 +252,63 @@ void tcp_client(void)
 	int rx_len = 0;
 
 	// Register identity with server and wait for an initial response.
-	if (msg_send(sock, g_identity, strlen(g_identity)) != 0)
+	char registration_buf[64];
+	snprintf(registration_buf, sizeof(registration_buf), "%s\n", g_identity);
+	if (msg_send(sock, registration_buf, strlen(registration_buf)) != 0)
 		goto CLEAN_UP;
 	rx_len = msg_recv(sock, rx_buf, rx_buf_size);
 	// NOTE: There is no strict validation of registration reply here.
 
 	ESP_LOGI(TAG_TCP, "Waiting for commands");
+
+	// ========== UDP SENSOR STREAMING SETUP ==========
+	// Create UDP socket for sensor data transmission
+	ESP_LOGI(TAG_UDP, "Setting up UDP socket for sensor streaming");
+
+	struct sockaddr_in udp_dest_addr;
+	udp_dest_addr.sin_addr.s_addr = dest_addr.sin_addr.s_addr; // Same server IP as TCP
+	udp_dest_addr.sin_family = AF_INET;
+	udp_dest_addr.sin_port = htons(DEFAULT_UDP_PORT); // UDP port 3001
+
+	int udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+	if (udp_sock < 0)
+	{
+		ESP_LOGE(TAG_UDP, "Unable to create UDP socket: errno %d", errno);
+		ESP_LOGW(TAG_UDP, "Continuing without sensor streaming");
+	}
+	else
+	{
+		ESP_LOGI(TAG_UDP, "UDP socket created for %s:%d", g_server_host, DEFAULT_UDP_PORT);
+
+		// Prepare task parameters (will be freed by task)
+		udp_task_params_t *task_params = (udp_task_params_t *)malloc(sizeof(udp_task_params_t));
+		task_params->sock = udp_sock;
+		task_params->dest_addr = udp_dest_addr;
+
+		// Launch sensor streaming task on core 0 (TCP runs on core 1)
+		BaseType_t task_created = xTaskCreatePinnedToCore(
+			udp_sensor_stream_task, // Task function
+			"UDP_Sensor_Stream",	// Task name
+			4096,					// Stack size (bytes)
+			(void *)task_params,	// Task parameters
+			5,						// Priority (same as TCP)
+			NULL,					// Task handle (not needed)
+			0						// Core 0
+		);
+
+		if (task_created != pdPASS)
+		{
+			ESP_LOGE(TAG_UDP, "Failed to create UDP sensor streaming task");
+			free(task_params);
+			close(udp_sock);
+		}
+		else
+		{
+			ESP_LOGI(TAG_UDP, "UDP sensor streaming task started at 10 Hz");
+		}
+	}
+	// ========== END UDP SETUP ==========
+
 	// Main receive loop: get JSON commands from server, parse them, execute
 	// robot actions (via motor driver functions) and send back a JSON result.
 	do
@@ -282,6 +399,62 @@ void tcp_client(void)
 				ESP_LOGW(TAG_TASK, "Received NULL command from server");
 				snprintf(tx_text, tx_text_len, "Received NULL command from server");
 				command = "NULL";
+			}
+			else if (strcmp(command, "move") == 0)
+			{
+				// Server sends "move" with duration_seconds in float_data[0]
+				// Convert to milliseconds and move forward
+				ESP_LOGI(TAG_TASK, "Performing command %s", command);
+				if (fDataArraySize <= 0)
+				{
+					snprintf(tx_text, tx_text_len, "No data received in float_data[]");
+				}
+				else if (fDataArray[0] <= 0)
+				{
+					snprintf(tx_text, tx_text_len, "Invalid duration_seconds in float_data[0]");
+				}
+				else
+				{
+					int duration_ms = (int)(fDataArray[0] * 1000.0f);
+					move_forward(duration_ms);
+					exec_result = fDataArray[0];
+					exec_status = MESSAGE_STATUS_SUCCESS;
+					snprintf(tx_text, tx_text_len, "Moved forward for %.2f seconds", fDataArray[0]);
+				}
+			}
+			else if (strcmp(command, "turn") == 0)
+			{
+				// Server sends "turn" with angle_degrees in float_data[0]
+				// Positive = right, negative = left
+				// Rough conversion: ~90 degrees = 500ms at current motor speeds
+				ESP_LOGI(TAG_TASK, "Performing command %s", command);
+				if (fDataArraySize <= 0)
+				{
+					snprintf(tx_text, tx_text_len, "No data received in float_data[]");
+				}
+				else
+				{
+					float angle = fDataArray[0];
+					int duration_ms = (int)(fabs(angle) / 90.0f * 500.0f);
+
+					if (angle > 0)
+					{
+						rotate_right(duration_ms);
+						snprintf(tx_text, tx_text_len, "Turned right %.1f degrees", angle);
+					}
+					else if (angle < 0)
+					{
+						rotate_left(duration_ms);
+						snprintf(tx_text, tx_text_len, "Turned left %.1f degrees", fabs(angle));
+					}
+					else
+					{
+						snprintf(tx_text, tx_text_len, "Zero angle, no turn performed");
+					}
+
+					exec_result = angle;
+					exec_status = MESSAGE_STATUS_SUCCESS;
+				}
 			}
 			else if (strcmp(command, "FORWARD") == 0)
 			{
@@ -781,4 +954,11 @@ void app_main(void)
 	// start wireless operation
 	ESP_LOGI(TAG_WIFI, "Start WiFi scan");
 	fast_scan();
+
+	// Keep app_main alive so event loop can process WiFi events
+	// The TCP client will run in the event handler once IP is obtained
+	while (1)
+	{
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
 }

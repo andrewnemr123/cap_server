@@ -1,7 +1,10 @@
-
 import json
 import socket
 import os
+import time
+from typing import Optional
+from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 import asyncio
@@ -17,8 +20,8 @@ HOST = "0.0.0.0"  # Listen on all network interfaces
 PORT = int(os.environ.get("SERVER_PORT", 3000))  # TCP port for commands
 UDP_PORT = int(os.environ.get("UDP_PORT", 3001))  # UDP port for sensor data
 
-# Enable or disable debug mode
-DEBUG_MODE = False
+# Enable or disable debug mode (set env SERVER_DEBUG=1/true to enable)
+DEBUG_MODE = os.environ.get("SERVER_DEBUG", "").lower() in ("1", "true", "yes", "on")
 MANUAL_MODE = True  # manual mode skips heavy STT/TTS initialization
 
 if not MANUAL_MODE:
@@ -126,6 +129,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
             # Decode sensor data (expecting JSON format)
             msg = data.decode('utf-8', errors='replace')
             sensor_data = json.loads(msg)
+            # Persist raw UDP payload
+            asyncio.create_task(self.server._persist_received('udp', addr, msg))
             
             # Store sensor data associated with the client address
             asyncio.create_task(self.server._handle_sensor_data(addr, sensor_data))
@@ -160,6 +165,31 @@ class RobotServer:
         self._sensor_timestamps: dict[tuple, float] = {}  # addr -> last update time
         self._lock = asyncio.Lock()
         self._stdin_task: asyncio.Task | None = None
+
+    async def _persist_received(self, kind: str, addr: tuple, payload: str):
+        """Persist received data under project_root/received_data as daily files per peer.
+        kind: 'tcp' or 'udp'
+        """
+        try:
+            root = Path(__file__).resolve().parents[2]
+            out_dir = root / "received_data"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            date_str = datetime.now().strftime("%Y%m%d")
+            ip = str(addr[0]).replace(":", "_")
+            port = str(addr[1]) if len(addr) > 1 else ("udp")
+            ext = "log" if kind == "tcp" else "jsonl"
+            file_path = out_dir / f"{date_str}_{ip}_{port}_{kind}.{ext}"
+
+            if not payload.endswith("\n"):
+                payload += "\n"
+
+            def _append(fp: Path, content: str):
+                with open(fp, "a", encoding="utf-8") as f:
+                    f.write(content)
+
+            await asyncio.to_thread(_append, file_path, payload)
+        except Exception as e:
+            print(f"⚠️ Failed to persist {kind} data from {addr}: {e}")
 
     async def start(self):
         # Start TCP server for commands
@@ -272,6 +302,23 @@ class RobotServer:
     async def _handle_sensor_data(self, addr: tuple, sensor_data: dict):
         """Process incoming sensor data from UDP."""
         async with self._lock:
+            self._sensor_data[addr] = {
+                "timestamp": time.time(),
+                "data": sensor_data
+            }
+        print(f"📊 Sensor data from {addr}: {len(sensor_data.get('scans', []))} scans")
+    
+    async def get_latest_sensor_data(self, addr: tuple, max_age: float = 1.0) -> Optional[dict]:
+        """Get latest sensor data for a client, if recent enough."""
+        async with self._lock:
+            entry = self._sensor_data.get(addr)
+            if entry and (time.time() - entry["timestamp"]) <= max_age:
+                return entry["data"]
+        return None
+    
+    async def _handle_sensor_data(self, addr: tuple, sensor_data: dict):
+        """Process incoming sensor data from UDP."""
+        async with self._lock:
             self._sensor_data[addr] = sensor_data
             self._sensor_timestamps[addr] = time.time()
         
@@ -341,6 +388,13 @@ class RobotServer:
                         break
                     
                     msg = data.decode("utf-8", errors="replace").rstrip()
+                    # Persist raw TCP inbound payload
+                    try:
+                        await self._persist_received('tcp', peer, data.decode('utf-8', errors='replace'))
+                    except Exception as _e:
+                        if DEBUG_MODE:
+                            print(f"⚠️ Failed to persist TCP from {peer}: {_e}")
+                    
                     print(f"🔍 [DEBUG] {peer} - Decoded message: '{msg}' (length: {len(msg)})")
                     
                     if msg:
